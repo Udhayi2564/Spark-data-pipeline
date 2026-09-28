@@ -21,7 +21,9 @@ class TargetManagerError(Exception):
     ) -> None:
 
         self.error_code: str = error_code
+
         self.message: str = message
+
         self.details: Dict[str, Any] = details or {}
 
         super().__init__(message)
@@ -191,6 +193,7 @@ def extract_table_name_from_ddl(
 
     alter_match: Optional[re.Match[str]] = re.search(
         r"ALTER\s+TABLE\s+"
+        r"(?:IF\s+EXISTS\s+)?"
         r"([A-Za-z_][A-Za-z0-9_$]*"
         r"(?:\.[A-Za-z_][A-Za-z0-9_$]*)?)",
         statement,
@@ -483,7 +486,7 @@ def extract_add_column_details(
 def extract_alter_column_type_details(
     statement: str,
 ) -> Optional[Tuple[str, str, str]]:
-    
+
     match: Optional[re.Match[str]] = re.search(
         r"ALTER\s+TABLE\s+"
         r"([A-Za-z_][A-Za-z0-9_$]*"
@@ -515,6 +518,151 @@ def extract_alter_column_type_details(
     )
 
 
+def extract_primary_key_details(
+    statement: str,
+) -> Optional[Tuple[str, str, List[str]]]:
+
+    match: Optional[re.Match[str]] = re.search(
+        r"ALTER\s+TABLE\s+"
+        r"([A-Za-z_][A-Za-z0-9_$]*"
+        r"(?:\.[A-Za-z_][A-Za-z0-9_$]*)?)"
+        r"\s+ADD\s+CONSTRAINT\s+"
+        r"([A-Za-z_][A-Za-z0-9_$]*)"
+        r"\s+PRIMARY\s+KEY\s*"
+        r"\((.*?)\)"
+        r"\s*$",
+        statement,
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    if match is None:
+
+        return None
+
+    table_name: str = match.group(1)
+
+    constraint_name: str = match.group(2)
+
+    columns_text: str = match.group(3)
+
+    raw_columns: List[str] = columns_text.split(",")
+
+    columns: List[str] = []
+
+    for raw_column in raw_columns:
+
+        column: str = normalize_identifier(
+            raw_column.strip()
+        )
+
+        if column != "":
+            columns.append(column)
+
+    if len(columns) == 0:
+
+        raise TargetManagerError(
+            error_code="INVALID_PRIMARY_KEY",
+            message="Primary key must contain at least one column.",
+            details={
+                "statement": statement,
+            },
+        )
+
+    return (
+        table_name,
+        constraint_name,
+        columns,
+    )
+
+
+def target_primary_key_exists(
+    schema_name: str,
+    table_name: str,
+    connection: Any,
+) -> bool:
+
+    cursor: Any = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_constraint AS constraint_info
+            INNER JOIN pg_class AS table_info
+                ON table_info.oid = constraint_info.conrelid
+            INNER JOIN pg_namespace AS schema_info
+                ON schema_info.oid = table_info.relnamespace
+            WHERE constraint_info.contype = 'p'
+              AND schema_info.nspname = %s
+              AND table_info.relname = %s
+        );
+        """,
+        (
+            schema_name,
+            table_name,
+        ),
+    )
+
+    row: Any = cursor.fetchone()
+
+    cursor.close()
+
+    return bool(row[0])
+
+
+def get_primary_key_columns(
+    schema_name: str,
+    table_name: str,
+    connection: Any,
+) -> List[str]:
+
+    cursor: Any = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT
+            attribute_info.attname
+        FROM pg_constraint AS constraint_info
+        INNER JOIN pg_class AS table_info
+            ON table_info.oid = constraint_info.conrelid
+        INNER JOIN pg_namespace AS schema_info
+            ON schema_info.oid = table_info.relnamespace
+        INNER JOIN LATERAL unnest(
+            constraint_info.conkey
+        ) WITH ORDINALITY AS key_columns(
+            column_number,
+            column_order
+        )
+            ON TRUE
+        INNER JOIN pg_attribute AS attribute_info
+            ON attribute_info.attrelid = table_info.oid
+           AND attribute_info.attnum = key_columns.column_number
+        WHERE constraint_info.contype = 'p'
+          AND schema_info.nspname = %s
+          AND table_info.relname = %s
+        ORDER BY key_columns.column_order;
+        """,
+        (
+            schema_name,
+            table_name,
+        ),
+    )
+
+    rows: List[Tuple[Any, ...]] = cursor.fetchall()
+
+    cursor.close()
+
+    columns: List[str] = []
+
+    for row in rows:
+
+        columns.append(
+            str(row[0])
+        )
+
+    return columns
+
+
 def execute_create_table(
     statement: str,
     connection: Any,
@@ -537,6 +685,7 @@ def execute_create_table(
         )
 
     schema_name: str
+
     actual_table_name: str
 
     schema_name, actual_table_name = split_table_name(
@@ -596,6 +745,7 @@ def execute_add_column(
     ) = details
 
     schema_name: str
+
     actual_table_name: str
 
     schema_name, actual_table_name = split_table_name(
@@ -681,6 +831,7 @@ def execute_alter_column_type(
     ) = details
 
     schema_name: str
+
     actual_table_name: str
 
     schema_name, actual_table_name = split_table_name(
@@ -770,6 +921,125 @@ def execute_alter_column_type(
     }
 
 
+def execute_add_primary_key(
+    statement: str,
+    connection: Any,
+) -> Dict[str, Any]:
+
+    details: Optional[
+        Tuple[str, str, List[str]]
+    ] = extract_primary_key_details(
+        statement=statement,
+    )
+
+    if details is None:
+
+        raise TargetManagerError(
+            error_code="INVALID_PRIMARY_KEY",
+            message="Unable to determine primary key details.",
+            details={
+                "statement": statement,
+            },
+        )
+
+    (
+        table_name,
+        constraint_name,
+        requested_columns,
+    ) = details
+
+    schema_name: str
+
+    actual_table_name: str
+
+    schema_name, actual_table_name = split_table_name(
+        table_name=table_name,
+    )
+
+    table_exists: bool = target_table_exists(
+        schema_name=schema_name,
+        table_name=actual_table_name,
+        connection=connection,
+    )
+
+    if not table_exists:
+
+        raise TargetManagerError(
+            error_code="TARGET_TABLE_NOT_FOUND",
+            message="Target table does not exist.",
+            details={
+                "table": f"{schema_name}.{actual_table_name}",
+            },
+        )
+
+    primary_key_exists: bool = target_primary_key_exists(
+        schema_name=schema_name,
+        table_name=actual_table_name,
+        connection=connection,
+    )
+
+    if primary_key_exists:
+
+        existing_columns: List[str] = (
+            get_primary_key_columns(
+                schema_name=schema_name,
+                table_name=actual_table_name,
+                connection=connection,
+            )
+        )
+
+        normalized_existing_columns: List[str] = [
+            column.lower()
+            for column in existing_columns
+        ]
+
+        normalized_requested_columns: List[str] = [
+            column.lower()
+            for column in requested_columns
+        ]
+
+        if (
+            normalized_existing_columns
+            == normalized_requested_columns
+        ):
+
+            return {
+                "table": f"{schema_name}.{actual_table_name}",
+                "operation": "ADD PRIMARY KEY",
+                "status": "already_exists",
+                "constraint": constraint_name,
+                "columns": existing_columns,
+            }
+
+        raise TargetManagerError(
+            error_code="PRIMARY_KEY_CONFLICT",
+            message=(
+                "Target table already has a different "
+                "primary key."
+            ),
+            details={
+                "table": f"{schema_name}.{actual_table_name}",
+                "existing_columns": existing_columns,
+                "requested_columns": requested_columns,
+                "requested_constraint": constraint_name,
+            },
+        )
+
+    cursor: Any = connection.cursor()
+
+    cursor.execute(statement)
+
+    cursor.close()
+
+    return {
+        "table": f"{schema_name}.{actual_table_name}",
+        "operation": "ADD PRIMARY KEY",
+        "status": "added",
+        "constraint": constraint_name,
+        "columns": requested_columns,
+    }
+
+
 def execute_ddl_statement(
     statement: str,
     connection: Any,
@@ -812,6 +1082,17 @@ def execute_ddl_statement(
         ):
 
             return execute_alter_column_type(
+                statement=normalized_statement,
+                connection=connection,
+            )
+
+        if re.search(
+            r"\bADD\s+CONSTRAINT\b.*\bPRIMARY\s+KEY\b",
+            normalized_statement,
+            re.IGNORECASE | re.DOTALL,
+        ):
+
+            return execute_add_primary_key(
                 statement=normalized_statement,
                 connection=connection,
             )

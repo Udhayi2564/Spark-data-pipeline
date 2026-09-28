@@ -20,10 +20,6 @@ from spark.jobs.target_schema_inspector import (
     validate_target_columns,
 )
 
-from spark.jobs.transformation_engine import (
-    apply_transformations,
-)
-
 from spark.jobs.migrate_state import (
     is_initial_migration,
     save_migration_state,
@@ -49,14 +45,9 @@ class BatchPipelineError(Exception):
     ) -> None:
 
         self.error_code: str = error_code
-
         self.message: str = message
-
         self.stage: str = stage
-
-        self.details: Dict[str, Any] = (
-            details or {}
-        )
+        self.details: Dict[str, Any] = details or {}
 
         super().__init__(message)
 
@@ -72,9 +63,7 @@ def read_from_oracle(
 
         if normalized_query.endswith(";"):
 
-            normalized_query = (
-                normalized_query[:-1]
-            )
+            normalized_query: str = normalized_query[:-1]
 
         dataframe: DataFrame = (
             spark.read
@@ -112,6 +101,15 @@ def write_to_postgres(
     schema_name: str,
     table_name: str,
 ) -> int:
+
+    """
+    Writes data to PostgreSQL using Spark JDBC.
+
+    This function is used only when the target table is confirmed
+    to be empty / suitable for an initial append.
+
+    Existing target rows must be handled through the upsert path.
+    """
 
     rows_to_write: int = dataframe.count()
 
@@ -165,7 +163,8 @@ def write_to_postgres(
                 message=(
                     f"Target table "
                     f"{full_table_name} "
-                    "already contains a conflicting key."
+                    "already contains a conflicting key. "
+                    "Use the incremental upsert path."
                 ),
                 stage="target_write",
                 details={
@@ -178,8 +177,7 @@ def write_to_postgres(
             "column" in error_lower
             and (
                 "not defined" in error_lower
-                or "does not exist"
-                in error_lower
+                or "does not exist" in error_lower
             )
         ):
 
@@ -228,15 +226,119 @@ def run_initial_full_load(
     dataframe: DataFrame,
     schema_name: str,
     table_name: str,
-) -> int:
+    target_columns: List[str],
+) -> Dict[str, int]:
 
-    rows_written: int = write_to_postgres(
-        dataframe=dataframe,
-        schema_name=schema_name,
-        table_name=table_name,
+    """
+    Handles the first migration safely.
+
+    If the target is empty, Spark JDBC append is used.
+
+    If the target already contains rows, the data is compared
+    against the target primary key and an upsert is performed.
+
+    This prevents duplicate primary-key failures when the pipeline
+    is executed again.
+    """
+
+    full_table_name: str = (
+        f"{schema_name}.{table_name}"
     )
 
-    return rows_written
+    dataframe_rows: int = dataframe.count()
+
+    if dataframe_rows == 0:
+
+        return {
+            "rows_detected": 0,
+            "new_rows": 0,
+            "updated_rows": 0,
+            "rows_written": 0,
+        }
+
+    connection: Any = (
+        get_postgres_connection()
+    )
+
+    try:
+
+        primary_key_columns: List[str] = (
+            get_primary_key_columns(
+                connection=connection,
+                schema_name=schema_name,
+                table_name=table_name,
+            )
+        )
+
+        if len(primary_key_columns) == 0:
+
+            connection.close()
+
+            rows_written: int = write_to_postgres(
+                dataframe=dataframe,
+                schema_name=schema_name,
+                table_name=table_name,
+            )
+
+            return {
+                "rows_detected": rows_written,
+                "new_rows": rows_written,
+                "updated_rows": 0,
+                "rows_written": rows_written,
+            }
+
+        (
+            changed_rows,
+            new_rows_count,
+            updated_rows_count,
+        ) = find_changed_rows(
+            dataframe=dataframe,
+            connection=connection,
+            schema_name=schema_name,
+            table_name=table_name,
+            target_columns=target_columns,
+            primary_key_columns=primary_key_columns,
+        )
+
+        rows_detected: int = len(changed_rows)
+
+        rows_written: int = 0
+
+        if rows_detected > 0:
+
+            rows_written = upsert_rows(
+                connection=connection,
+                schema_name=schema_name,
+                table_name=table_name,
+                target_columns=target_columns,
+                primary_key_columns=primary_key_columns,
+                rows=changed_rows,
+            )
+
+        return {
+            "rows_detected": rows_detected,
+            "new_rows": new_rows_count,
+            "updated_rows": updated_rows_count,
+            "rows_written": rows_written,
+        }
+
+    except PostgreSQLUpsertError as error:
+
+        raise BatchPipelineError(
+            error_code="UPSERT_FAILED",
+            message=str(error),
+            stage="target_upsert",
+            details={
+                "target_table": full_table_name,
+            },
+        ) from error
+
+    finally:
+
+        try:
+            connection.close()
+        except Exception:
+            pass
 
 
 def run_incremental_upsert(
@@ -245,6 +347,10 @@ def run_incremental_upsert(
     table_name: str,
     target_columns: List[str],
 ) -> Dict[str, int]:
+
+    full_table_name: str = (
+        f"{schema_name}.{table_name}"
+    )
 
     connection: Any = (
         get_postgres_connection()
@@ -266,15 +372,13 @@ def run_incremental_upsert(
                 error_code="TARGET_PRIMARY_KEY_NOT_FOUND",
                 message=(
                     f"Target table "
-                    f"{schema_name}.{table_name} "
+                    f"{full_table_name} "
                     "must have a primary key "
                     "for incremental upsert."
                 ),
                 stage="target_validation",
                 details={
-                    "target_table": (
-                        f"{schema_name}.{table_name}"
-                    ),
+                    "target_table": full_table_name,
                 },
             )
 
@@ -322,9 +426,7 @@ def run_incremental_upsert(
             message=str(error),
             stage="target_upsert",
             details={
-                "target_table": (
-                    f"{schema_name}.{table_name}"
-                ),
+                "target_table": full_table_name,
             },
         ) from error
 
@@ -392,12 +494,24 @@ def run_transform_pipeline(
             )
 
             print()
-            print("============================================================")
-            print(f"STARTING TRANSFORM PAIR {pair_index}")
-            print("============================================================")
-            print(f"Source target : {full_target_table}")
-            print("Pipeline      : Oracle -> Spark -> PostgreSQL")
-            print("------------------------------------------------------------")
+            print(
+                "============================================================"
+            )
+            print(
+                f"STARTING TRANSFORM PAIR {pair_index}"
+            )
+            print(
+                "============================================================"
+            )
+            print(
+                f"Target table : {full_target_table}"
+            )
+            print(
+                "Pipeline     : Oracle -> Spark -> PostgreSQL"
+            )
+            print(
+                "------------------------------------------------------------"
+            )
 
             try:
 
@@ -469,6 +583,8 @@ def run_transform_pipeline(
                     details=error.details,
                 ) from error
 
+            # RAW LAYER
+
             source_dataframe: DataFrame = (
                 read_from_oracle(
                     spark=spark,
@@ -482,12 +598,22 @@ def run_transform_pipeline(
 
             print()
             print("RAW LAYER")
-            print("------------------------------------------------------------")
-            print(f"RAW processing started  : Oracle -> Spark")
-            print(f"RAW rows extracted     : {rows_extracted}")
+            print(
+                "------------------------------------------------------------"
+            )
+            print(
+                "RAW processing started  : Oracle -> Spark"
+            )
+            print(
+                f"RAW rows extracted     : {rows_extracted}"
+            )
             print("RAW schema:")
             source_dataframe.printSchema()
-            print("RAW layer processed    : SUCCESS")
+            print(
+                "RAW layer processed    : SUCCESS"
+            )
+
+            # HARMONIZED LAYER
 
             transformed_dataframe: DataFrame = (
                 source_dataframe
@@ -495,8 +621,12 @@ def run_transform_pipeline(
 
             print()
             print("HARMONIZED LAYER")
-            print("------------------------------------------------------------")
-            print("HARMONIZED processing  : Started")
+            print(
+                "------------------------------------------------------------"
+            )
+            print(
+                "HARMONIZED processing  : Started"
+            )
 
             transformed_dataframe = (
                 harmonize_dataframe(
@@ -505,7 +635,9 @@ def run_transform_pipeline(
                 )
             )
 
-            print("HARMONIZED processing  : Completed")
+            print(
+                "HARMONIZED processing  : Completed"
+            )
 
             missing_after_harmonization: List[
                 str
@@ -602,24 +734,49 @@ def run_transform_pipeline(
                 transformed_dataframe.count()
             )
 
-            print(f"HARMONIZED rows processed : {rows_after_transformation}")
+            print(
+                f"HARMONIZED rows processed : "
+                f"{rows_after_transformation}"
+            )
+
             print("HARMONIZED schema:")
             transformed_dataframe.printSchema()
-            print("HARMONIZED layer processed : SUCCESS")
+
+            print(
+                "HARMONIZED layer processed : SUCCESS"
+            )
+
+            # SERVING LAYER
 
             print()
             print("SERVING LAYER")
-            print("------------------------------------------------------------")
-            print("SERVING processing      : Started")
-            print(f"SERVING rows prepared   : {rows_after_transformation}")
-            print(f"SERVING columns         : {', '.join(selected_columns)}")
-            print("SERVING layer processed : SUCCESS")
+            print(
+                "------------------------------------------------------------"
+            )
+            print(
+                "SERVING processing      : Started"
+            )
+            print(
+                f"SERVING rows prepared   : "
+                f"{rows_after_transformation}"
+            )
+            print(
+                "SERVING columns         : "
+                f"{', '.join(selected_columns)}"
+            )
+            print(
+                "SERVING layer processed : SUCCESS"
+            )
+
+            # SOURCE TABLE
 
             source_table: str = (
                 extract_source_table_from_query(
                     extraction_query
                 )
             )
+
+            # MIGRATION STATE
 
             initial_migration: bool = (
                 is_initial_migration(
@@ -630,14 +787,17 @@ def run_transform_pipeline(
                 )
             )
 
+            # TARGET LOAD
+
             if initial_migration:
 
+                print()
                 print(
                     "Migration state: "
-                    "INITIAL FULL LOAD"
+                    "INITIAL MIGRATION"
                 )
 
-                rows_written: int = (
+                initial_result: Dict[str, int] = (
                     run_initial_full_load(
                         dataframe=(
                             transformed_dataframe
@@ -648,7 +808,34 @@ def run_transform_pipeline(
                         table_name=(
                             target_table
                         ),
+                        target_columns=(
+                            target_columns
+                        ),
                     )
+                )
+
+                rows_detected: int = (
+                    initial_result[
+                        "rows_detected"
+                    ]
+                )
+
+                new_rows: int = (
+                    initial_result[
+                        "new_rows"
+                    ]
+                )
+
+                updated_rows: int = (
+                    initial_result[
+                        "updated_rows"
+                    ]
+                )
+
+                rows_written: int = (
+                    initial_result[
+                        "rows_written"
+                    ]
                 )
 
                 save_migration_state(
@@ -661,22 +848,24 @@ def run_transform_pipeline(
                     ),
                 )
 
-                result_status: str = (
-                    "initial_load"
-                )
+                if (
+                    updated_rows > 0
+                    or new_rows < rows_extracted
+                ):
 
-                rows_detected: int = (
-                    rows_written
-                )
+                    result_status: str = (
+                        "initial_load_upsert"
+                    )
 
-                new_rows: int = (
-                    rows_written
-                )
+                else:
 
-                updated_rows: int = 0
+                    result_status = (
+                        "initial_load"
+                    )
 
             else:
 
+                print()
                 print(
                     "Migration state: "
                     "INCREMENTAL UPSERT"
@@ -740,16 +929,39 @@ def run_transform_pipeline(
 
             print()
             print("TARGET LOAD")
-            print("------------------------------------------------------------")
-            print(f"Target table            : {full_target_table}")
-            print(f"Rows detected           : {rows_detected}")
-            print(f"New rows                : {new_rows}")
-            print(f"Updated rows            : {updated_rows}")
-            print(f"Rows written            : {rows_written}")
-            print("Target load             : SUCCESS")
-            print("------------------------------------------------------------")
             print(
-                f"TRANSFORM PAIR {pair_index} COMPLETED SUCCESSFULLY"
+                "------------------------------------------------------------"
+            )
+            print(
+                f"Target table            : "
+                f"{full_target_table}"
+            )
+            print(
+                f"Rows detected           : "
+                f"{rows_detected}"
+            )
+            print(
+                f"New rows                : "
+                f"{new_rows}"
+            )
+            print(
+                f"Updated rows            : "
+                f"{updated_rows}"
+            )
+            print(
+                f"Rows written            : "
+                f"{rows_written}"
+            )
+            print(
+                "Target load             : SUCCESS"
+            )
+            print(
+                "------------------------------------------------------------"
+            )
+            print(
+                f"TRANSFORM PAIR "
+                f"{pair_index} "
+                "COMPLETED SUCCESSFULLY"
             )
 
             results.append(
@@ -774,6 +986,8 @@ def run_transform_pipeline(
                     "updated_rows": updated_rows,
                 }
             )
+
+        # FINAL PIPELINE SUMMARY
 
         total_rows_extracted: int = sum(
             int(result["rows_extracted"])
@@ -802,18 +1016,50 @@ def run_transform_pipeline(
 
         print()
         print()
-        print("============================================================")
-        print("ORACLE -> POSTGRESQL MIGRATION COMPLETED SUCCESSFULLY")
-        print("============================================================")
-        print(f"Layers processed      : RAW -> HARMONIZED -> SERVING")
-        print(f"Tables processed      : {len(results)}")
-        print(f"Total rows extracted  : {total_rows_extracted}")
-        print(f"Total rows detected   : {total_rows_detected}")
-        print(f"Total new rows        : {total_new_rows}")
-        print(f"Total updated rows    : {total_updated_rows}")
-        print(f"Total rows written    : {total_rows_written}")
-        print("Pipeline status       : SUCCESS")
-        print("============================================================")
+        print(
+            "============================================================"
+        )
+        print(
+            "ORACLE -> POSTGRESQL MIGRATION "
+            "COMPLETED SUCCESSFULLY"
+        )
+        print(
+            "============================================================"
+        )
+        print(
+            "Layers processed      : "
+            "RAW -> HARMONIZED -> SERVING"
+        )
+        print(
+            f"Tables processed      : "
+            f"{len(results)}"
+        )
+        print(
+            f"Total rows extracted  : "
+            f"{total_rows_extracted}"
+        )
+        print(
+            f"Total rows detected   : "
+            f"{total_rows_detected}"
+        )
+        print(
+            f"Total new rows        : "
+            f"{total_new_rows}"
+        )
+        print(
+            f"Total updated rows    : "
+            f"{total_updated_rows}"
+        )
+        print(
+            f"Total rows written    : "
+            f"{total_rows_written}"
+        )
+        print(
+            "Pipeline status       : SUCCESS"
+        )
+        print(
+            "============================================================"
+        )
 
         return results
 

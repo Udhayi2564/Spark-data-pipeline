@@ -6,7 +6,9 @@ from typing import Any, Dict, List, Optional, Tuple
 def extract_source_table(
     specification: Dict[str, Any],
 ) -> str:
+
     source: Dict[str, Any] = specification["source"]
+
     table: str = source["table"]
 
     return table
@@ -15,7 +17,9 @@ def extract_source_table(
 def extract_source_query(
     specification: Dict[str, Any],
 ) -> Optional[str]:
+
     source: Dict[str, Any] = specification["source"]
+
     query: Optional[str] = source.get("query")
 
     return query
@@ -24,7 +28,9 @@ def extract_source_query(
 def extract_target_schema(
     specification: Dict[str, Any],
 ) -> str:
+
     target: Dict[str, Any] = specification["target"]
+
     schema: str = target["schema"]
 
     return schema
@@ -33,7 +39,9 @@ def extract_target_schema(
 def extract_target_table(
     specification: Dict[str, Any],
 ) -> str:
+
     target: Dict[str, Any] = specification["target"]
+
     table: str = target["table"]
 
     return table
@@ -42,7 +50,9 @@ def extract_target_table(
 def extract_target_mode(
     specification: Dict[str, Any],
 ) -> str:
+
     target: Dict[str, Any] = specification["target"]
+
     mode: str = target["mode"]
 
     return mode
@@ -51,7 +61,9 @@ def extract_target_mode(
 def extract_execution_mode(
     specification: Dict[str, Any],
 ) -> str:
+
     execution: Dict[str, Any] = specification["execution"]
+
     mode: str = execution["mode"]
 
     return mode
@@ -60,7 +72,9 @@ def extract_execution_mode(
 def extract_incremental(
     specification: Dict[str, Any],
 ) -> bool:
+
     execution: Dict[str, Any] = specification["execution"]
+
     incremental: bool = execution["incremental"]
 
     return incremental
@@ -69,6 +83,7 @@ def extract_incremental(
 def extract_watermark_column(
     specification: Dict[str, Any],
 ) -> Optional[str]:
+
     execution: Dict[str, Any] = specification["execution"]
 
     watermark_column: Optional[str] = execution.get(
@@ -81,6 +96,7 @@ def extract_watermark_column(
 def normalize_sql(
     sql: str,
 ) -> str:
+
     normalized_sql: str = sql.strip()
 
     if normalized_sql.endswith(";"):
@@ -92,9 +108,11 @@ def normalize_sql(
 def normalize_sql_list(
     statements: List[str],
 ) -> List[str]:
+
     normalized_statements: List[str] = []
 
     for statement in statements:
+
         normalized_statement: str = normalize_sql(
             statement
         )
@@ -106,26 +124,30 @@ def normalize_sql_list(
 
     return normalized_statements
 
+
 def extract_create_execution_data(
     payload: Dict[str, Any],
 ) -> Dict[str, Any]:
     """
     Extract only the fields required by the backend
-    from the finalized Groq CREATE response.
+    from the finalized CREATE response.
 
-    Required fields:
+    Expected AI response structure:
 
-        result.source
-        result.target
-        result.table_management
+        result
+            └── table_management
+                    ├── provider
+                    ├── source
+                    ├── target
+                    └── table_management
 
-    Ignored fields:
+    Backend execution uses only:
 
-        provider
-        files
-        diff
-        summary
-        layout
+        source
+        target
+        table_management
+
+    Other AI response fields are ignored.
     """
 
     result: Dict[str, Any] = payload.get(
@@ -133,15 +155,42 @@ def extract_create_execution_data(
         {},
     )
 
+    if not isinstance(
+        result,
+        dict,
+    ):
+        raise ValueError(
+            "result must be a JSON object."
+        )
+
+    management: Any = result.get(
+        "table_management"
+    )
+
+    if not isinstance(
+        management,
+        dict,
+    ):
+        raise ValueError(
+            "result.table_management must be "
+            "a JSON object."
+        )
+
     source: str = str(
-        result.get("source", "")
+        management.get(
+            "source",
+            "",
+        )
     ).strip().lower()
 
     target: str = str(
-        result.get("target", "")
+        management.get(
+            "target",
+            "",
+        )
     ).strip().lower()
 
-    raw_table_management: Any = result.get(
+    raw_table_management: Any = management.get(
         "table_management",
         [],
     )
@@ -151,13 +200,18 @@ def extract_create_execution_data(
         list,
     ):
         raise ValueError(
-            "result.table_management must be a list."
+            "result.table_management.table_management "
+            "must be a list."
         )
 
     table_management: List[str] = []
 
     for statement in raw_table_management:
-        if not isinstance(statement, str):
+
+        if not isinstance(
+            statement,
+            str,
+        ):
             raise ValueError(
                 "Every table_management statement "
                 "must be a string."
@@ -174,17 +228,20 @@ def extract_create_execution_data(
 
     if source == "":
         raise ValueError(
-            "result.source is required."
+            "result.table_management.source "
+            "is required."
         )
 
     if target == "":
         raise ValueError(
-            "result.target is required."
+            "result.table_management.target "
+            "is required."
         )
 
     if len(table_management) == 0:
         raise ValueError(
-            "result.table_management cannot be empty."
+            "result.table_management.table_management "
+            "cannot be empty."
         )
 
     return {
@@ -199,14 +256,15 @@ def extract_transform_execution_data(
 ) -> Dict[str, Any]:
     """
     Extract only the fields required by the backend
-    from the finalized Gemini TRANSFORM response.
+    from the finalized TRANSFORM response.
 
-    Required fields:
+    Expected structure:
 
-        result.source
-        result.target
-        result.data_extraction
-        result.data_management
+        result
+            ├── source
+            ├── target
+            ├── data_extraction
+            └── data_management
 
     Ignored fields:
 
@@ -222,12 +280,26 @@ def extract_transform_execution_data(
         {},
     )
 
+    if not isinstance(
+        result,
+        dict,
+    ):
+        raise ValueError(
+            "result must be a JSON object."
+        )
+
     source: str = str(
-        result.get("source", "")
+        result.get(
+            "source",
+            "",
+        )
     ).strip().lower()
 
     target: str = str(
-        result.get("target", "")
+        result.get(
+            "target",
+            "",
+        )
     ).strip().lower()
 
     raw_data_extraction: Any = result.get(
@@ -259,7 +331,11 @@ def extract_transform_execution_data(
     data_extraction: List[str] = []
 
     for statement in raw_data_extraction:
-        if not isinstance(statement, str):
+
+        if not isinstance(
+            statement,
+            str,
+        ):
             raise ValueError(
                 "Every data_extraction statement "
                 "must be a string."
@@ -277,7 +353,11 @@ def extract_transform_execution_data(
     data_management: List[str] = []
 
     for statement in raw_data_management:
-        if not isinstance(statement, str):
+
+        if not isinstance(
+            statement,
+            str,
+        ):
             raise ValueError(
                 "Every data_management statement "
                 "must be a string."
@@ -312,7 +392,9 @@ def extract_transform_execution_data(
             "result.data_management cannot be empty."
         )
 
-    if len(data_extraction) != len(data_management):
+    if len(data_extraction) != len(
+        data_management
+    ):
         raise ValueError(
             "result.data_extraction and "
             "result.data_management must contain "
@@ -330,6 +412,7 @@ def extract_transform_execution_data(
 def extract_source_table_from_query(
     query: str,
 ) -> str:
+
     normalized_query: str = normalize_sql(
         query
     )
@@ -360,6 +443,7 @@ def extract_source_table_from_query(
 def extract_insert_target(
     insert_query: str,
 ) -> Tuple[str, List[str]]:
+
     normalized_query: str = normalize_sql(
         insert_query
     )
@@ -400,6 +484,7 @@ def extract_insert_target(
     raw_columns: List[str] = columns_text.split(",")
 
     for raw_column in raw_columns:
+
         column: str = raw_column.strip()
 
         column = column.strip('"')
@@ -422,7 +507,9 @@ def extract_insert_target(
 def extract_insert_target_details(
     insert_query: str,
 ) -> Tuple[str, str, List[str]]:
+
     target_table: str
+
     target_columns: List[str]
 
     (
@@ -433,6 +520,7 @@ def extract_insert_target_details(
     )
 
     if "." in target_table:
+
         parts: List[str] = target_table.split(
             ".",
             1,
@@ -443,6 +531,7 @@ def extract_insert_target_details(
         table_name: str = parts[1].strip('"')
 
     else:
+
         target_schema = "public"
 
         table_name = target_table.strip('"')
@@ -457,6 +546,7 @@ def extract_insert_target_details(
 def validate_select_query(
     query: str,
 ) -> None:
+
     normalized_query: str = normalize_sql(
         query
     )
@@ -481,25 +571,26 @@ def validate_select_query(
         )
 
 
-
 def validate_insert_template(
     insert_query: str,
 ) -> None:
+
     extract_insert_target(
         insert_query
     )
 
 
-
 def validate_create_statements(
     table_management: List[str],
 ) -> None:
+
     if len(table_management) == 0:
         raise ValueError(
             "table_management cannot be empty."
         )
 
     for statement in table_management:
+
         normalized_statement: str = normalize_sql(
             statement
         )
@@ -559,6 +650,7 @@ def validate_transform_pairs(
     data_extraction: List[str],
     data_management: List[str],
 ) -> None:
+
     if len(data_extraction) != len(
         data_management
     ):
@@ -575,11 +667,13 @@ def validate_transform_pairs(
         )
 
     for extraction_query in data_extraction:
+
         validate_select_query(
             extraction_query
         )
 
     for management_query in data_management:
+
         validate_insert_template(
             management_query
         )
@@ -589,6 +683,7 @@ def build_transform_pairs(
     data_extraction: List[str],
     data_management: List[str],
 ) -> List[Dict[str, Any]]:
+
     validate_transform_pairs(
         data_extraction=data_extraction,
         data_management=data_management,
@@ -599,6 +694,7 @@ def build_transform_pairs(
     for index in range(
         len(data_extraction)
     ):
+
         extraction_query: str = normalize_sql(
             data_extraction[index]
         )
@@ -614,7 +710,9 @@ def build_transform_pairs(
         )
 
         target_schema: str
+
         target_table: str
+
         target_columns: List[str]
 
         (
