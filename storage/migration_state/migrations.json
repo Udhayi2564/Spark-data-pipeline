@@ -1,0 +1,14 @@
+{
+    "hr.employees__public.departments": {
+        "source_table": "HR.EMPLOYEES",
+        "target_table": "public.departments",
+        "initialized": true,
+        "last_rows_processed": 11
+    },
+    "hr.employees__public.employees": {
+        "source_table": "HR.EMPLOYEES",
+        "target_table": "public.employees",
+        "initialized": true,
+        "last_rows_processed": 117
+    }
+}
